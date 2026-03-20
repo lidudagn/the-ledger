@@ -145,7 +145,7 @@ class TestLoadAllGlobalOrdering:
         await store.append("loan-001", sample_events[1:2], expected_version=1)
 
         events = []
-        async for e in await store.load_all():
+        async for e in store.load_all():
             events.append(e)
 
         assert len(events) == 3
@@ -162,7 +162,7 @@ class TestLoadAllTypeFilter:
         await store.append("loan-001", sample_events, expected_version=-1)
 
         events = []
-        async for e in await store.load_all(event_types=["ApplicationSubmitted"]):
+        async for e in store.load_all(event_types=["ApplicationSubmitted"]):
             events.append(e)
 
         assert len(events) == 1
