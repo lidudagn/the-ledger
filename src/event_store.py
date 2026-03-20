@@ -23,6 +23,7 @@ System Contracts:
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -40,9 +41,19 @@ from models.events import (
 )
 
 
+async def _init_connection(conn: asyncpg.Connection) -> None:
+    """Register JSONB codec on every new connection."""
+    await conn.set_type_codec(
+        'jsonb',
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema='pg_catalog',
+    )
+
+
 async def create_pool(database_url: str, **kwargs: Any) -> asyncpg.Pool:
-    """Create an asyncpg connection pool."""
-    return await asyncpg.create_pool(database_url, **kwargs)
+    """Create an asyncpg connection pool with JSONB codec on all connections."""
+    return await asyncpg.create_pool(database_url, init=_init_connection, **kwargs)
 
 
 class EventStore:

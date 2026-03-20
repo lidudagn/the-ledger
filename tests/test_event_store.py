@@ -23,11 +23,9 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 async def db_store():
     """EventStore connected to real DB. Cleans up after each test."""
-    import asyncpg
+    from event_store import EventStore, create_pool
 
-    from event_store import EventStore
-
-    pool = await asyncpg.create_pool(DATABASE_URL)
+    pool = await create_pool(DATABASE_URL)
 
     # Clean tables before test
     async with pool.acquire() as conn:
