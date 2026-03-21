@@ -6,7 +6,7 @@ This document outlines the core architectural decisions, tradeoffs, and quantita
 
 ---
 
-## 1. Event Store Schema Column Justifications
+## 1. Event Store Schema
 
 Per Phase 1 requirements, standard enterprise event sourcing strictly forbids unnecessary columns. Every column in our schema exists for a specific mathematical or operational reason:
 
@@ -35,7 +35,7 @@ Per Phase 1 requirements, standard enterprise event sourcing strictly forbids un
 
 ---
 
-## 2. Aggregate Boundary Justification
+## 2. Aggregate Boundaries
 
 **Decision:** `ComplianceRecord` is modelled as a separate aggregate from `LoanApplication`.
 
@@ -57,9 +57,15 @@ In Phase 2, we deliberately chose to have agents like `CreditAnalysis` append th
 
 **Decision:** We chose Option B for Phase 2 simplicity. We acknowledge this reduces aggregate purity—the loan stream effectively "owns" the result of the agent's work. It creates tighter coupling but drastically simplifies testing and synchronous command validation.
 
+**Future Correction Path (Scaling Limitation):**
+This design will NOT scale without introducing integration events or a process manager. Under high concurrency, the `LoanApplication` aggregate becomes a hotspot. Multiple agents writing to the same stream will inevitably collide. To correct this for true enterprise scale, we must:
+1. Move agent outputs to their own `agent-{id}` streams.
+2. Introduce integration events (e.g., `CreditAnalysisIntegrated`) that the loan stream listens to.
+3. Or introduce a Process Manager / Saga pattern to actively coordinate the asynchronous state transitions across isolated streams.
+
 ---
 
-## 2. Projection Strategy & SLOs
+## 3. Projection Strategy
 
 ### Inline vs. Async
 *   **ApplicationSummary (Async):** We chose Async. While an inline projection would provide read-your-own-writes consistency, pushing the update to an Async Daemon improves write throughput for the event store. At 1,000 applications/hour, optimizing command latency is critical.
@@ -78,6 +84,18 @@ The system operates under strict **eventual consistency**. Read models (projecti
 *   **The Contract:** UI clients and API consumers must be designed to tolerate stale reads within the defined SLO bounds. 
 *   **Critical Flows:** Operations requiring strong consistency (e.g., verifying an application hasn't already been approved before disbursing funds) must rely on synchronous write-side command handlers evaluating the aggregate state, *never* on projection state.
 
+### Idempotency Guarantees
+*   **The Invariant:** What prevents double-processing across projections if the daemon crashes mid-batch?
+*   **The Key:** `global_position` is the unique, absolute idempotency key per event.
+*   **Enforcement:** Each projection must guarantee that an event is logically processed exactly once. For `ApplicationSummary` and `AgentPerformanceLedger`, this is handled via `UPSERT` semantics (idempotent overwrites). For append-only models like `ComplianceAuditView`, duplicates must be ignored via strict database constraints (`INSERT ... ON CONFLICT DO NOTHING`) or by comparing the incoming `global_position` against the projection's internal high-water mark.
+
+### Backpressure Strategy
+What happens if projections fall behind the event store ingestion rate (lag spikes)?
+*   **Dynamic Batch Sizing:** Increase the number of events pulled per `_process_batch()` cycle to flush queues faster.
+*   **Parallelization:** Decouple workers so that `ApplicationSummary` and `ComplianceAuditView` are processed by independent physical worker processes, rather than sequentially in the same loop.
+*   **Alerting:** Emit critical alerts when lag exceeds the defined SLO (`p99 > 500ms` for core, `> 2000ms` for compliance).
+*   **Load Shedding:** If necessary during catastrophic spikes, temporarily pause low-priority projections (e.g., `AgentPerformanceLedger`) to dedicate compute resources to critical readiness projections.
+
 ### Distributed Daemon Analysis (Marten Async Parallel)
 If our system scaled to require a distributed, multi-node projection daemon architecture (like Marten 7.0), our current single-process Python `asyncio` loop would fail because multiple workers would process the exact same events simultaneously.
 *   **Coordination Primitive:** To achieve distributed projection execution, we would implement **Leased Checkpoints** using PostgreSQL advisory locks (`pg_try_advisory_lock()`). Each projection instance would attempt to acquire a lock on a specific `projection_name` row in the `projection_checkpoints` table.
@@ -85,12 +103,14 @@ If our system scaled to require a distributed, multi-node projection daemon arch
 
 ---
 
-## 4. Concurrency Analysis & Budgets
+## 4. Concurrency
 
 **Scenario:** Peak load of 100 concurrent applications, each processed by 4 AI agents simultaneously.
 
 *   **The Collision Vector:** Without explicit orchestration, all 4 agents might finish their tasks and attempt to write `DecisionGenerated`, `CreditAnalysisCompleted`, `FraudScreeningCompleted`, and `ComplianceCheckCompleted` to the system simultaneously. Due to our aggregate boundaries, only events targeting the identical stream (`loan-{id}`) will collide.
-*   **Expected `OptimisticConcurrencyError` Rate (Worst-Case Analysis):** While organic, uncoordinated collisions are rare due to LLM latency variance, orchestrated workflows create dangerous burst contention. When the `DecisionOrchestrator` generates its final recommendation, it triggers synchronous `HumanReviewRequested` commands. Simultaneously, background compliance checks might finalize. This creates hotspot contention on the `loan-{id}` stream. In these worst-case burst scenarios, we expect up to **15-20 OCEs per minute** across the 100 applications, tightly clustered around lifecycle transitions.
+*   **Expected `OptimisticConcurrencyError` Rate (Worst-Case Analysis):** While organic, uncoordinated collisions are rare due to LLM latency variance, orchestrated workflows create dangerous burst contention. When the `DecisionOrchestrator` generates its final recommendation, it triggers synchronous `HumanReviewRequested` commands. Simultaneously, background compliance checks might finalize. This creates hotspot contention on the `loan-{id}` stream.
+    *   **Assumptions:** 100 concurrent applications, 3 separate actors writing to the `loan-{id}` stream simultaneously during a decision phase, ~50ms collision window for write transactions, 10 events/sec peak sustained rate.
+    *   **Calculation:** Given these factors tightly clustered around lifecycle transitions, we model the expected collision probability to yield **~15-20 OCEs per minute** across the total system load during burst phases.
 *   **Retry Strategy:** We employ a **Jittered Exponential Backoff**. 
     *   Attempt 1: Immediate reload and retry.
     *   Attempt 2: Reload, wait 50ms + random(0-50ms), retry.
@@ -99,7 +119,7 @@ If our system scaled to require a distributed, multi-node projection daemon arch
 
 ---
 
-## 4. Upcasting Inference Decisions
+## 5. Upcasting
 
 When evolving `CreditAnalysisCompleted` from v1 to v2, we must introduce three new fields: `model_version`, `confidence_score`, and `regulatory_basis`. Since historical v1 events lack this data, the upcaster must infer it.
 
@@ -111,7 +131,7 @@ When evolving `CreditAnalysisCompleted` from v1 to v2, we must introduce three n
 
 ---
 
-## 5. EventStoreDB Comparison
+## 6. EventStoreDB Comparison
 
 While we implemented The Ledger using PostgreSQL natively (ideal for Python/FastAPI integration without external dependencies), the enterprise standard for this throughput profile is EventStoreDB (ESDB).
 
@@ -126,7 +146,7 @@ Our PostgreSQL implementation relies on polling `SELECT ... WHERE global_positio
 
 ---
 
-## 6. What I Would Do Differently
+## 7. Future Improvements
 
 If granted another full day to refine the architecture, the single most significant decision I would reconsider is **the physical implementation of the `Outbox` pattern and how it couples to the `ProjectionDaemon`.**
 
@@ -140,4 +160,10 @@ Currently, our `ProjectionDaemon` acts effectively as a polling consumer on the 
 3. The Relay reads the outbox and publishes the events onto an actual message bus (e.g., Redis Streams or Kafka).
 4. The `ProjectionDaemon` subscribes to Redis Streams. 
 
-This shifts the architecture from a polling monolith to a true reactive, push-based distributed system. It offloads read-pressure from the primary database, provides **at-least-once delivery** guarantees (paired with **effectively-once** processing via our idempotent projection consumers), and perfectly positions the system for the Polyglot Bridge integration required in later enterprise phases.
+**Outbox Guarantees & Failure Modes:**
+This architecture introduces new failure boundaries we must explicitly handle:
+*   **The Relay Crash:** What if the Relay crashes *after* publishing to Kafka but *before* marking the outbox row as `published_at=NOW()`? 
+*   **Guarantee:** The system provides strict **at-least-once delivery** from the outbox to the bus. 
+*   **Consumer Requirement:** Consequently, downstream consumers *must* be strictly idempotent (as defined in Section 3). The `published_at` timestamp is purely a performance optimization for truncating the outbox table; it is *never* a correctness guarantee against duplicate publishing.
+
+This shifts the architecture from a polling monolith to a true reactive, push-based distributed system. It offloads read-pressure from the primary database and perfectly positions the system for the Polyglot Bridge integration required in later enterprise phases.
