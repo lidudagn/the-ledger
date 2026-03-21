@@ -320,18 +320,14 @@ class LoanApplicationAggregate:
                     f"Causal chain broken: session '{session_id}' has no events"
                 )
 
-            # Check session contains a decision-type event for this application
+            # In Phase 2, decision events (CreditAnalysisCompleted) live on the loan stream.
+            # Therefore, we verify causal chain by checking if the contributing session
+            # was actually recorded in our own aggregate state as having done the analysis.
             has_decision = False
-            for event in events:
-                payload = event.payload
-                if event.event_type in (
-                    "CreditAnalysisCompleted",
-                    "FraudScreeningCompleted",
-                    "ComplianceCheckCompleted",
-                ):
-                    if payload.get("application_id") == self.application_id:
-                        has_decision = True
-                        break
+            if self.credit_session_id and self.credit_session_id in session_id:
+                has_decision = True
+            elif self.fraud_session_id and self.fraud_session_id in session_id:
+                has_decision = True
 
             if not has_decision:
                 raise DomainError(

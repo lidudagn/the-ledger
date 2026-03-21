@@ -245,6 +245,7 @@ async def handle_fraud_screening_completed(
         FraudScreeningCompleted(payload={
             "application_id": cmd.application_id,
             "agent_id": cmd.agent_id,
+            "session_id": cmd.session_id,
             "fraud_score": cmd.fraud_score,
             "anomaly_flags": cmd.anomaly_flags,
             "screening_model_version": cmd.screening_model_version,
