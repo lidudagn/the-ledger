@@ -202,52 +202,67 @@ class ComplianceAuditViewProjection(Projection):
         }
 
     def get_compliance_at(
-        self, application_id: str, as_of: datetime
+        self,
+        application_id: str,
+        as_of: datetime,
+        up_to_position: int | None = None,
     ) -> dict[str, Any] | None:
         """
         Compliance state as it existed at a specific moment in time.
 
         Algorithm:
-        1. Check for nearest snapshot BEFORE as_of
-        2. If snapshot exists at or before as_of, load events AFTER snapshot up to as_of
+        1. Check for nearest snapshot BEFORE as_of (and <= up_to_position if given)
+        2. If snapshot exists at or before as_of, return that snapshot state
         3. If no snapshot, load ALL events with recorded_at <= as_of
         4. Reconstruct compliance state from events
+
+        Args:
+            application_id: The loan application ID.
+            as_of: Point-in-time to query compliance state.
+            up_to_position: Optional global_position upper bound for precision.
         """
         as_of_iso = as_of.isoformat() if as_of else None
 
         # Find best snapshot
-        snapshots = self._store.query(
-            SNAPSHOTS_TABLE,
-            lambda r: (
-                r.get("application_id") == application_id
-                and (r.get("snapshot_at") or "") <= (as_of_iso or "")
-            ),
-        )
+        def snapshot_filter(r: dict) -> bool:
+            if r.get("application_id") != application_id:
+                return False
+            if (r.get("snapshot_at") or "") > (as_of_iso or ""):
+                return False
+            if up_to_position is not None:
+                if r.get("global_position", 0) > up_to_position:
+                    return False
+            return True
+
+        snapshots = self._store.query(SNAPSHOTS_TABLE, snapshot_filter)
 
         if snapshots:
-            # Use the latest snapshot at or before as_of
-            snapshots.sort(key=lambda s: s.get("snapshot_at", ""))
+            # Use the latest snapshot at or before as_of by global_position
+            snapshots.sort(key=lambda s: s.get("global_position", 0))
             best_snapshot = snapshots[-1]
 
-            # Return snapshot state (events after snapshot but before as_of
-            # could modify state, but ComplianceCheckCompleted is the boundary)
             return {
                 "application_id": application_id,
                 "overall_verdict": best_snapshot.get("overall_verdict"),
                 "has_hard_block": best_snapshot.get("has_hard_block", False),
                 "rules": best_snapshot.get("rules_evaluated", []),
                 "snapshot_at": best_snapshot.get("snapshot_at"),
+                "global_position": best_snapshot.get("global_position"),
                 "source": "snapshot",
             }
 
         # No snapshot — reconstruct from raw events
-        events = self._store.query(
-            EVENTS_TABLE,
-            lambda r: (
-                r.get("application_id") == application_id
-                and (r.get("recorded_at") or "") <= (as_of_iso or "")
-            ),
-        )
+        def event_filter(r: dict) -> bool:
+            if r.get("application_id") != application_id:
+                return False
+            if (r.get("recorded_at") or "") > (as_of_iso or ""):
+                return False
+            if up_to_position is not None:
+                if r.get("global_position", 0) > up_to_position:
+                    return False
+            return True
+
+        events = self._store.query(EVENTS_TABLE, event_filter)
 
         if not events:
             return None
