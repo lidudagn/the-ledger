@@ -1,1 +1,5 @@
-
+DOMAIN_NOTES.md
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
