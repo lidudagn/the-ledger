@@ -65,3 +65,79 @@ CREATE TABLE IF NOT EXISTS outbox (
     published_at     TIMESTAMPTZ,
     attempts         SMALLINT NOT NULL DEFAULT 0
 );
+
+
+-- =============================================================================
+-- Phase 3: Projection Tables (CQRS Read Models)
+-- =============================================================================
+
+-- Projection 1: ApplicationSummary — One row per loan application, current state.
+CREATE TABLE IF NOT EXISTS application_summary (
+    application_id       TEXT PRIMARY KEY,
+    state                TEXT NOT NULL DEFAULT 'UNKNOWN',
+    applicant_id         TEXT,
+    requested_amount_usd NUMERIC,
+    approved_amount_usd  NUMERIC,
+    risk_tier            TEXT,
+    fraud_score          NUMERIC,
+    compliance_status    TEXT,
+    decision             TEXT,
+    agent_sessions       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    last_event_type      TEXT,
+    last_event_at        TIMESTAMPTZ,
+    human_reviewer_id    TEXT,
+    final_decision_at    TIMESTAMPTZ,
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Projection 2: AgentPerformanceLedger — Metrics per agent + model_version.
+CREATE TABLE IF NOT EXISTS agent_performance (
+    agent_id             TEXT NOT NULL,
+    model_version        TEXT NOT NULL,
+    analyses_completed   INTEGER NOT NULL DEFAULT 0,
+    decisions_generated  INTEGER NOT NULL DEFAULT 0,
+    avg_confidence_score NUMERIC,
+    avg_duration_ms      NUMERIC,
+    approve_count        INTEGER NOT NULL DEFAULT 0,
+    decline_count        INTEGER NOT NULL DEFAULT 0,
+    refer_count          INTEGER NOT NULL DEFAULT 0,
+    human_override_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at        TIMESTAMPTZ,
+    last_seen_at         TIMESTAMPTZ,
+    PRIMARY KEY (agent_id, model_version)
+);
+
+-- Projection 3: ComplianceAuditView — Append-only compliance event log.
+-- Stores every compliance event for temporal query support.
+CREATE TABLE IF NOT EXISTS compliance_audit_events (
+    id                   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    application_id       TEXT NOT NULL,
+    event_type           TEXT NOT NULL,
+    rule_id              TEXT,
+    rule_version         TEXT,
+    verdict              TEXT,
+    failure_reason       TEXT,
+    is_hard_block        BOOLEAN DEFAULT FALSE,
+    regulation_version   TEXT,
+    evidence_hash        TEXT,
+    global_position      BIGINT NOT NULL UNIQUE,
+    recorded_at          TIMESTAMPTZ NOT NULL,
+    payload              JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_compliance_audit_app
+    ON compliance_audit_events (application_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_compliance_audit_global
+    ON compliance_audit_events (global_position);
+
+-- Compliance snapshots for temporal queries.
+-- Created on each ComplianceCheckCompleted event.
+CREATE TABLE IF NOT EXISTS compliance_snapshots (
+    application_id       TEXT NOT NULL,
+    snapshot_at          TIMESTAMPTZ NOT NULL,
+    global_position      BIGINT NOT NULL,
+    overall_verdict      TEXT NOT NULL,
+    rules_evaluated      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    has_hard_block       BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (application_id, snapshot_at)
+);
