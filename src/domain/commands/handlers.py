@@ -400,8 +400,8 @@ async def handle_human_review_completed(
         })
     ]
 
-    # If override approves a declined application, append ApplicationApproved
-    if cmd.override and cmd.final_decision == "APPROVE":
+    # Append final decision event based on human's verdict
+    if cmd.final_decision == "APPROVE":
         events.append(ApplicationApproved(payload={
             "application_id": cmd.application_id,
             "approved_amount_usd": 0.0,  # set by caller
