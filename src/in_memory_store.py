@@ -137,9 +137,9 @@ class InMemoryEventStore:
         from_position: int = 0,
         to_position: int | None = None,
     ) -> list[StoredEvent]:
-        """Load events from a stream. Raises StreamNotFoundError if missing."""
+        """Load events from a stream. Returns empty list if missing."""
         if stream_id not in self._streams:
-            raise StreamNotFoundError(stream_id=stream_id)
+            return []
 
         events = self._streams[stream_id]
         filtered = [e for e in events if e.stream_position > from_position]

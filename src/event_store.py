@@ -1,222 +1,230 @@
 """
-The Ledger — Async EventStore (PostgreSQL + asyncpg)
+ledger/event_store.py — PostgreSQL-backed EventStore
+=====================================================
+Append-only event store with OCC (optimistic concurrency control).
+All agents and projections use this class.
 
-The core event store with optimistic concurrency control.
-All writes go through append() which enforces OCC atomically.
-
-System Contracts:
-    C1: Requires PostgreSQL READ COMMITTED isolation (default).
-        SELECT ... FOR UPDATE guarantees single-writer per stream.
-    C2: aggregate_type derived from stream_id.split("-")[0].
-        Coupling risk accepted for Phase 1 simplicity.
-    C3: global_position provides total ordering, NOT contiguous sequencing.
-        Gaps on rollback. Use > not BETWEEN.
-    C4: metadata always contains correlation_id and causation_id.
-        EventStore owns metadata construction, not the caller.
-    C5: Outbox provides at-least-once delivery.
-        event_id is dedup key. Consumers MUST be idempotent.
-    C6: Events in single append() get contiguous stream_positions in list order.
-    C7: Append idempotency NOT guaranteed. Caller's responsibility.
-    C8: events table is append-only by convention.
-    C9: Low per-stream contention assumed. High contention serializes by design.
+Methods:
+  1. stream_version()   — returns 0 if stream doesn't exist
+  2. append()           — OCC-protected atomic append, returns new version
+  3. load_stream()      — returns list[StoredEvent] in stream_position order
+  4. load_all()         — async generator yielding StoredEvent by global_position
+  5. get_event()        — single StoredEvent by UUID (for causation chain)
+  6. save_checkpoint()  — projection checkpoint persistence
+  7. load_checkpoint()  — projection checkpoint retrieval
 """
-
 from __future__ import annotations
 
 import json
-import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator
+from uuid import UUID
 
 import asyncpg
 
 from models.events import (
-    BaseEvent,
     OptimisticConcurrencyError,
     StoredEvent,
     StreamArchivedError,
     StreamMetadata,
-    StreamNotFoundError,
 )
 
+# ─── POOL FACTORY ─────────────────────────────────────────────────────────────
 
-async def _init_connection(conn: asyncpg.Connection) -> None:
-    """Register JSONB codec on every new connection."""
-    await conn.set_type_codec(
-        'jsonb',
-        encoder=json.dumps,
-        decoder=json.loads,
-        schema='pg_catalog',
+async def create_pool(db_url: str, **kwargs) -> asyncpg.Pool:
+    """Create an asyncpg connection pool."""
+    return await asyncpg.create_pool(
+        db_url,
+        min_size=kwargs.get("min_size", 2),
+        max_size=kwargs.get("max_size", 10),
     )
 
 
-async def create_pool(database_url: str, **kwargs: Any) -> asyncpg.Pool:
-    """Create an asyncpg connection pool with JSONB codec on all connections."""
-    return await asyncpg.create_pool(database_url, init=_init_connection, **kwargs)
+from upcasting.registry import UpcasterRegistry
 
+
+# ─── EVENT STORE ──────────────────────────────────────────────────────────────
 
 class EventStore:
     """
-    Async event store backed by PostgreSQL.
+    Append-only PostgreSQL event store. All agents and projections use this class.
 
-    All methods use asyncpg for non-blocking database access.
-    Optimistic concurrency control is enforced in append() via
-    SELECT ... FOR UPDATE within a transaction.
+    Usage (pool-based):
+        pool = await create_pool(DATABASE_URL)
+        store = EventStore(pool)
+        ...
+        await pool.close()
+
+    Usage (url-based):
+        store = EventStore.from_url(DATABASE_URL)
+        await store.connect()
+        ...
+        await store.close()
     """
 
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(self, pool: asyncpg.Pool, upcaster_registry: UpcasterRegistry | None = None):
         self._pool = pool
+        self.upcasters = upcaster_registry
 
-    # -------------------------------------------------------------------------
-    # append() — The critical method
-    # -------------------------------------------------------------------------
+    @classmethod
+    def from_url(cls, db_url: str, upcaster_registry: UpcasterRegistry | None = None) -> "EventStore":
+        """Create an EventStore that will manage its own pool via connect()/close()."""
+        store = cls.__new__(cls)
+        store._pool = None
+        store._db_url = db_url
+        store.upcasters = upcaster_registry
+        return store
+
+    async def connect(self) -> None:
+        """Create the connection pool (only for url-based construction)."""
+        if self._pool is None:
+            self._pool = await asyncpg.create_pool(self._db_url, min_size=2, max_size=10)
+
+    async def close(self) -> None:
+        """Close the connection pool."""
+        if self._pool:
+            await self._pool.close()
+
+    # ── stream_version ────────────────────────────────────────────────────────
+
+    async def stream_version(self, stream_id: str) -> int:
+        """
+        Returns current version, or 0 if stream doesn't exist.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT current_version FROM event_streams WHERE stream_id = $1",
+                stream_id,
+            )
+            return row["current_version"] if row else 0
+
+    # ── append ────────────────────────────────────────────────────────────────
 
     async def append(
         self,
         stream_id: str,
         events: list[BaseEvent],
-        expected_version: int,
+        expected_version: int,    # -1=new stream, 0+=expected current
         correlation_id: str | None = None,
         causation_id: str | None = None,
+        command_id: str | None = None,
     ) -> int:
         """
-        Atomically appends events to stream_id.
-        Raises OptimisticConcurrencyError if stream version != expected_version.
-        Writes to outbox in same transaction.
-
-        Args:
-            stream_id: Target stream (e.g. "loan-123")
-            events: List of events to append
-            expected_version: -1 for new stream, N for exact version match
-            correlation_id: Groups related events (auto-generated if None — C4)
-            causation_id: The event that caused these events (optional)
-
-        Returns:
-            New stream version after append.
-
-        Raises:
-            OptimisticConcurrencyError: Version mismatch
-            StreamArchivedError: Stream is archived (one-way)
+        Appends events atomically with OCC. Returns the new stream version.
         """
         if not events:
             raise ValueError("Cannot append empty event list")
 
-        # C4: correlation_id auto-generated if not provided
-        if correlation_id is None:
-            correlation_id = str(uuid.uuid4())
-
         async with self._pool.acquire() as conn:
             async with conn.transaction():
-                # Step 1: Lock the stream row (C1: READ COMMITTED + FOR UPDATE)
+                # 0. Idempotency check — deduplicate by command_id
+                if command_id:
+                    dup = await conn.fetchrow(
+                        "SELECT event_id FROM events"
+                        " WHERE stream_id = $1 AND metadata @> $2::jsonb",
+                        stream_id,
+                        json.dumps({"command_id": command_id}),
+                    )
+                    if dup:
+                        # Already processed — return current version (idempotent)
+                        ver = await conn.fetchrow(
+                            "SELECT current_version FROM event_streams WHERE stream_id = $1",
+                            stream_id,
+                        )
+                        return ver["current_version"] if ver else 0
+
+                # 1. Lock stream row (prevents concurrent appends)
                 row = await conn.fetchrow(
-                    """
-                    SELECT current_version, archived_at
-                    FROM event_streams
-                    WHERE stream_id = $1
-                    FOR UPDATE
-                    """,
+                    "SELECT current_version, archived_at FROM event_streams "
+                    "WHERE stream_id = $1 FOR UPDATE",
                     stream_id,
                 )
 
-                if row is None:
-                    # Stream does not exist
-                    if expected_version != -1:
-                        # Caller expects a stream that doesn't exist
-                        raise OptimisticConcurrencyError(
-                            stream_id=stream_id,
-                            expected_version=expected_version,
-                            actual_version=0,
-                        )
+                if row and row["archived_at"] is not None:
+                    raise StreamArchivedError(stream_id)
 
-                    # Create new stream (C2: aggregate_type from stream_id)
-                    aggregate_type = stream_id.split("-")[0]
+                # 2. OCC check — separate logic for new vs existing streams
+                if row is None:
+                    # New stream: only expected_version=-1 is valid
+                    if expected_version != -1:
+                        raise OptimisticConcurrencyError(stream_id, expected_version, 0)
+                    current = 0  # positions start at 1 (current + 1)
+                    # Derive aggregate type from known stream prefixes
+                    parts = stream_id.split("-")
+                    aggregate_type = parts[0]
                     await conn.execute(
-                        """
-                        INSERT INTO event_streams (stream_id, aggregate_type, current_version)
-                        VALUES ($1, $2, 0)
-                        """,
+                        "INSERT INTO event_streams(stream_id, aggregate_type, current_version)"
+                        " VALUES($1, $2, 0)",
                         stream_id,
                         aggregate_type,
                     )
-                    current_version = 0
                 else:
-                    # Stream exists
-                    current_version = row["current_version"]
-                    archived_at = row["archived_at"]
+                    # Existing stream: exact version match required
+                    current = row["current_version"]
+                    if current != expected_version:
+                        raise OptimisticConcurrencyError(stream_id, expected_version, current)
 
-                    # Check archive status
-                    if archived_at is not None:
-                        raise StreamArchivedError(stream_id=stream_id)
+                positions = []
+                # Remove `metadata` dict merging, use correlation_id and causation_id
+                meta: dict[str, str] = {}
+                if correlation_id:
+                    meta["correlation_id"] = correlation_id
+                if causation_id:
+                    meta["causation_id"] = causation_id
+                if command_id:
+                    meta["command_id"] = command_id
 
-                    # OCC check
-                    if current_version != expected_version:
-                        raise OptimisticConcurrencyError(
-                            stream_id=stream_id,
-                            expected_version=expected_version,
-                            actual_version=current_version,
-                        )
+                now = datetime.now(timezone.utc)
 
-                # Step 2: Insert events (C6: contiguous positions in list order)
-                new_version = current_version
-                event_ids = []
-
-                for event in events:
-                    new_version += 1
-                    event_id = uuid.uuid4()
-                    event_ids.append(event_id)
-
-                    # Build metadata (C4: EventStore owns metadata construction)
-                    metadata = {
-                        "correlation_id": correlation_id,
-                        "causation_id": causation_id,
-                        **(event.metadata if event.metadata else {}),
-                    }
-
-                    await conn.execute(
-                        """
-                        INSERT INTO events (
-                            event_id, stream_id, stream_position,
-                            event_type, event_version, payload, metadata
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                        """,
-                        event_id,
-                        stream_id,
-                        new_version,
-                        event.event_type,
-                        event.event_version,
-                        event.payload,
-                        metadata,
-                    )
-
-                # Step 3: Insert into outbox (C5: same transaction)
                 for i, event in enumerate(events):
+                    if hasattr(event, "to_store_dict"):
+                        event_dict = event.to_store_dict()
+                    else:
+                        event_dict = event.model_dump(exclude_none=True)
+
+                    pos = current + 1 + i
+                    # INSERT with RETURNING to get the actual event_id for outbox FK
+                    row = await conn.fetchrow(
+                        "INSERT INTO events(stream_id, stream_position, event_type,"
+                        " event_version, payload, metadata, recorded_at)"
+                        " VALUES($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7)"
+                        " RETURNING event_id",
+                        stream_id,
+                        pos,
+                        event_dict["event_type"],
+                        event_dict.get("event_version", 1),
+                        json.dumps(event_dict.get("payload", {})),
+                        json.dumps(meta),
+                        now,
+                    )
+                    actual_event_id = row["event_id"]
+                    positions.append(pos)
+
+                    # Outbox entry — uses the REAL event_id from the INSERT
                     await conn.execute(
-                        """
-                        INSERT INTO outbox (event_id, destination, payload)
-                        VALUES ($1, $2, $3)
-                        """,
-                        event_ids[i],
-                        "default",
-                        event.payload,
+                        "INSERT INTO outbox(event_id, destination, payload)"
+                        " VALUES($1, $2, $3::jsonb)",
+                        actual_event_id,
+                        "internal.bus",
+                        json.dumps({
+                            "stream_id": stream_id,
+                            "event_type": event_dict["event_type"],
+                            "payload": event_dict.get("payload", {}),
+                            "metadata": meta,
+                        }),
                     )
 
-                # Step 4: Update stream version
+                # 5. Update stream version
+                new_version = current + len(events)
                 await conn.execute(
-                    """
-                    UPDATE event_streams
-                    SET current_version = $1
-                    WHERE stream_id = $2
-                    """,
+                    "UPDATE event_streams SET current_version=$1 WHERE stream_id=$2",
                     new_version,
                     stream_id,
                 )
 
                 return new_version
 
-    # -------------------------------------------------------------------------
-    # load_stream()
-    # -------------------------------------------------------------------------
+    # ── load_stream ───────────────────────────────────────────────────────────
 
     async def load_stream(
         self,
@@ -225,194 +233,191 @@ class EventStore:
         to_position: int | None = None,
     ) -> list[StoredEvent]:
         """
-        Load events from a stream in stream_position order.
-
-        Raises StreamNotFoundError if the stream does not exist.
-        Returns empty list for a stream with no events in the given range
-        (but the stream itself must exist).
+        Loads events from a stream in stream_position order.
+        Returns list[StoredEvent]. Applies upcasters if registered.
+        Returns empty list if stream does not exist.
         """
         async with self._pool.acquire() as conn:
-            # Verify stream exists
-            exists = await conn.fetchval(
+            # Check stream exists for consistent behavior with InMemoryEventStore
+            stream_row = await conn.fetchrow(
                 "SELECT 1 FROM event_streams WHERE stream_id = $1",
                 stream_id,
             )
-            if exists is None:
-                raise StreamNotFoundError(stream_id=stream_id)
+            if stream_row is None:
+                return []
 
-            # Build query with optional range filters
-            query = """
-                SELECT event_id, stream_id, stream_position, global_position,
-                       event_type, event_version, payload, metadata, recorded_at
-                FROM events
-                WHERE stream_id = $1 AND stream_position > $2
-            """
+            q = (
+                "SELECT event_id, stream_id, stream_position, global_position,"
+                " event_type, event_version, payload, metadata, recorded_at"
+                " FROM events WHERE stream_id=$1 AND stream_position>$2"
+            )
             params: list[Any] = [stream_id, from_position]
 
             if to_position is not None:
-                query += " AND stream_position <= $3"
+                q += " AND stream_position<=$3"
                 params.append(to_position)
 
-            query += " ORDER BY stream_position ASC"
+            q += " ORDER BY stream_position ASC"
+            rows = await conn.fetch(q, *params)
 
-            rows = await conn.fetch(query, *params)
-
-            return [
-                StoredEvent(
+            events: list[StoredEvent] = []
+            for row in rows:
+                e = StoredEvent(
                     event_id=row["event_id"],
                     stream_id=row["stream_id"],
                     stream_position=row["stream_position"],
                     global_position=row["global_position"],
                     event_type=row["event_type"],
                     event_version=row["event_version"],
-                    payload=dict(row["payload"]),
-                    metadata=dict(row["metadata"]),
+                    payload=json.loads(row["payload"]) if isinstance(row["payload"], str) else dict(row["payload"]) if row["payload"] else {},
+                    metadata=json.loads(row["metadata"]) if isinstance(row["metadata"], str) else dict(row["metadata"]) if row["metadata"] else {},
                     recorded_at=row["recorded_at"],
                 )
-                for row in rows
-            ]
+                if self.upcasters:
+                    e = self.upcasters.upcast(e)
+                events.append(e)
+            return events
 
-    # -------------------------------------------------------------------------
-    # load_all() — async generator with pull-based backpressure
-    # -------------------------------------------------------------------------
+    # ── load_all ──────────────────────────────────────────────────────────────
 
     async def load_all(
         self,
         from_global_position: int = 0,
         event_types: list[str] | None = None,
         batch_size: int = 500,
-    ) -> AsyncIterator[StoredEvent]:
+    ) -> AsyncGenerator[StoredEvent, None]:
         """
-        Load all events across all streams, ordered by global_position.
-
-        Async iteration provides pull-based backpressure — the database
-        is only queried when the consumer advances iteration. batch_size
-        caps memory per fetch.
+        Async generator yielding all events by global_position as StoredEvent.
+        Used by the ProjectionDaemon.
         """
-        current_position = from_global_position
-
         async with self._pool.acquire() as conn:
+            pos = from_global_position
             while True:
-                if event_types:
-                    rows = await conn.fetch(
-                        """
-                        SELECT event_id, stream_id, stream_position, global_position,
-                               event_type, event_version, payload, metadata, recorded_at
-                        FROM events
-                        WHERE global_position > $1 AND event_type = ANY($2)
-                        ORDER BY global_position ASC
-                        LIMIT $3
-                        """,
-                        current_position,
-                        event_types,
-                        batch_size,
-                    )
-                else:
-                    rows = await conn.fetch(
-                        """
-                        SELECT event_id, stream_id, stream_position, global_position,
-                               event_type, event_version, payload, metadata, recorded_at
-                        FROM events
-                        WHERE global_position > $1
-                        ORDER BY global_position ASC
-                        LIMIT $2
-                        """,
-                        current_position,
-                        batch_size,
-                    )
+                q = (
+                    "SELECT global_position, event_id, stream_id, stream_position,"
+                    " event_type, event_version, payload, metadata, recorded_at"
+                    " FROM events WHERE global_position > $1"
+                )
+                params: list[Any] = [pos]
 
+                if event_types:
+                    q += " AND event_type = ANY($2)"
+                    params.append(event_types)
+
+                q += f" ORDER BY global_position ASC LIMIT ${len(params) + 1}"
+                params.append(batch_size)
+
+                rows = await conn.fetch(q, *params)
                 if not rows:
                     break
-
                 for row in rows:
-                    yield StoredEvent(
+                    e = StoredEvent(
                         event_id=row["event_id"],
                         stream_id=row["stream_id"],
                         stream_position=row["stream_position"],
                         global_position=row["global_position"],
                         event_type=row["event_type"],
                         event_version=row["event_version"],
-                        payload=dict(row["payload"]),
-                        metadata=dict(row["metadata"]),
+                        payload=json.loads(row["payload"]) if isinstance(row["payload"], str) else dict(row["payload"]) if row["payload"] else {},
+                        metadata=json.loads(row["metadata"]) if isinstance(row["metadata"], str) else dict(row["metadata"]) if row["metadata"] else {},
                         recorded_at=row["recorded_at"],
                     )
-                    current_position = row["global_position"]
-
-                # If we got fewer rows than batch_size, we've consumed everything
+                    if self.upcasters:
+                        e = self.upcasters.upcast(e)
+                    yield e
+                pos = rows[-1]["global_position"]
                 if len(rows) < batch_size:
                     break
 
-    # -------------------------------------------------------------------------
-    # stream_version()
-    # -------------------------------------------------------------------------
+    # ── get_event ─────────────────────────────────────────────────────────────
 
-    async def stream_version(self, stream_id: str) -> int:
+    async def get_event(self, event_id: UUID) -> StoredEvent | None:
         """
-        Returns the current version of a stream.
-        Returns 0 if the stream does not exist (not an error).
+        Loads one event by UUID. Used for causation chain lookups.
         """
         async with self._pool.acquire() as conn:
-            version = await conn.fetchval(
-                "SELECT current_version FROM event_streams WHERE stream_id = $1",
-                stream_id,
+            row = await conn.fetchrow(
+                "SELECT event_id, stream_id, stream_position, global_position,"
+                " event_type, event_version, payload, metadata, recorded_at"
+                " FROM events WHERE event_id=$1",
+                event_id,
             )
-            return version if version is not None else 0
+            if not row:
+                return None
+            return StoredEvent(
+                event_id=row["event_id"],
+                stream_id=row["stream_id"],
+                stream_position=row["stream_position"],
+                global_position=row["global_position"],
+                event_type=row["event_type"],
+                event_version=row["event_version"],
+                payload=json.loads(row["payload"]) if isinstance(row["payload"], str) else dict(row["payload"]) if row["payload"] else {},
+                metadata=json.loads(row["metadata"]) if isinstance(row["metadata"], str) else dict(row["metadata"]) if row["metadata"] else {},
+                recorded_at=row["recorded_at"],
+            )
 
-    # -------------------------------------------------------------------------
-    # archive_stream() — one-way operation
-    # -------------------------------------------------------------------------
+    # ── Checkpoint management ─────────────────────────────────────────────────
+
+    async def save_checkpoint(self, projection_name: str, position: int) -> None:
+        """Persist the last-processed global_position for a projection."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO projection_checkpoints(projection_name, last_position, updated_at)"
+                " VALUES($1, $2, NOW())"
+                " ON CONFLICT(projection_name) DO UPDATE"
+                " SET last_position = $2, updated_at = NOW()",
+                projection_name,
+                position,
+            )
+
+    async def load_checkpoint(self, projection_name: str) -> int:
+        """Load the last-processed global_position for a projection. Default 0."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT last_position FROM projection_checkpoints"
+                " WHERE projection_name = $1",
+                projection_name,
+            )
+            return row["last_position"] if row else 0
+
+    # ── Archive ───────────────────────────────────────────────────────────────
 
     async def archive_stream(self, stream_id: str) -> None:
-        """
-        Archives a stream. One-way operation.
-        Archived streams: can be read, cannot be appended to, cannot be unarchived.
-        """
+        """Mark stream as archived. Archived streams cannot be appended to."""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
-                """
-                UPDATE event_streams
-                SET archived_at = NOW()
-                WHERE stream_id = $1 AND archived_at IS NULL
-                """,
+                "UPDATE event_streams SET archived_at = NOW()"
+                " WHERE stream_id = $1 AND archived_at IS NULL",
                 stream_id,
             )
             if result == "UPDATE 0":
                 # Either stream doesn't exist or already archived
-                exists = await conn.fetchval(
-                    "SELECT 1 FROM event_streams WHERE stream_id = $1",
+                row = await conn.fetchrow(
+                    "SELECT stream_id FROM event_streams WHERE stream_id = $1",
                     stream_id,
                 )
-                if exists is None:
-                    raise StreamNotFoundError(stream_id=stream_id)
-                # Already archived — idempotent, no error
+                if not row:
+                    from models.events import StreamNotFoundError
+                    raise StreamNotFoundError(stream_id)
 
-    # -------------------------------------------------------------------------
-    # get_stream_metadata()
-    # -------------------------------------------------------------------------
+    # ── Stream metadata ──────────────────────────────────────────────────────
 
-    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata:
-        """
-        Returns metadata for a stream.
-        Raises StreamNotFoundError if not found.
-        """
+    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:
+        """Return stream metadata as a StreamMetadata object."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                SELECT stream_id, aggregate_type, current_version,
-                       created_at, archived_at, metadata
-                FROM event_streams
-                WHERE stream_id = $1
-                """,
+                "SELECT stream_id, aggregate_type, current_version, created_at,"
+                " archived_at, metadata"
+                " FROM event_streams WHERE stream_id = $1",
                 stream_id,
             )
-            if row is None:
-                raise StreamNotFoundError(stream_id=stream_id)
-
+            if not row:
+                return None
             return StreamMetadata(
                 stream_id=row["stream_id"],
                 aggregate_type=row["aggregate_type"],
                 current_version=row["current_version"],
                 created_at=row["created_at"],
                 archived_at=row["archived_at"],
-                metadata=dict(row["metadata"]),
+                metadata=dict(row["metadata"]) if row["metadata"] else {},
             )

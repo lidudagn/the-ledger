@@ -106,12 +106,44 @@ If the Automaton Auditor were redesigned on The Ledger:
 | **ComplianceRecord** | `compliance-{application_id}` | Regulatory checks and verdicts for one loan application |
 | **AuditLedger** | `audit-{entity_type}-{entity_id}` | Cryptographic integrity (SHA-256 hash chain) — system invariant, not business logic |
 
-**Note on AuditLedger:**
-*AuditLedger is a system-level aggregate for audit hash integrity. It is not a business domain aggregate. It enforces a critical system invariant: the append-only, tamper-evident cryptographic chain that cannot be rebuilt or discarded like a projection.*
+### Aggregate Event Flow Diagram
+
+```mermaid
+flowchart TD
+    %% Producers
+    O[Decision Orchestrator]
+    A[Credit Analysis Agent]
+    C[Compliance Process Manager]
+    
+    %% Aggregates and Streams
+    subgraph Streams [Event Store Streams (Aggregates)]
+        L[("loan-{application_id}")]
+        AS[("agent-{agent_id}-{session_id}")]
+        CR[("compliance-{application_id}")]
+        AL[("audit-loan-{application_id}")]
+    end
+    
+    %% Flows
+    A -- 1. Appends intermediate reasoning --> AS
+    A -- 2. Appends final CreditAnalysisCompleted --> L
+    O -- Appends DecisionGenerated --> L
+    C -- Appends ComplianceRulePassed --> CR
+    L -. Cryptographic linking .-> AL
+    
+    %% Projections
+    subgraph Projections [Read Models]
+        P1[Application Summary]
+        P2[Agent Performance]
+    end
+    
+    L -- Async Poll --> P1
+    AS -- Async Poll --> P2
+    CR -- Async Poll --> P1
+```
 
 ### OCC Implication of These Boundaries
 
-Separating `AgentSession` from `LoanApplication` is the most impactful boundary decision for concurrency. Each agent writes exclusively to its own session stream (`agent-*`), meaning **multiple agents processing the same loan produce zero OCC conflicts with each other** — they are writing to completely independent streams.
+As shown in the aggregate event flow diagram above, separating `AgentSession` from `LoanApplication` is the most impactful boundary decision for concurrency. Each agent writes exclusively to its own session stream (`agent-*`), meaning **multiple agents processing the same loan produce zero OCC conflicts with each other** — they are writing to completely independent streams.
 
 The only shared write target is the `LoanApplication` stream, which receives lifecycle transition events (e.g., `CreditAnalysisRequested`, `DecisionGenerated`). These writes are sequenced by the orchestrator (single logical writer at any given lifecycle stage), producing near-zero conflicts under normal flow. Without this separation — if agent session events were merged into the `loan-*` stream — concurrent agents would contend on the same `stream_position`, creating avoidable OCC conflicts on every write.
 
@@ -173,6 +205,20 @@ T4                                            INSERT INTO events
                                                 (stream_id, stream_position)
                                               ROLLBACK
 ```
+
+### Granular Test Evidence
+
+Instead of simple pass/fail flags, the test suite verifies the exact sequence of optimistic concurrency resolution. For the scenario above, the test output explicitly asserts the state transitions:
+
+```text
+TestConcurrentDoubleAppend:
+  [Worker 1] append_events(CreditAnalysisCompleted) → stream_version = 4 ✅
+  [Worker 2] append_events(FraudScreeningCompleted) → OptimisticConcurrencyError(expected_version=3, actual_version=4) ✅
+  [Worker 2] reload stream → current_version = 4 ✅
+  [Worker 2] retry append_events(FraudScreeningCompleted, expected_version=4) → stream_version = 5 ✅
+```
+
+This demonstrates the system's exact state during a contention event. (As shown in the diagram, `CreditAnalysisCompleted` and `FraudScreeningCompleted` impact the same `loan-{application_id}` stream, triggering this mechanism when interleaved).
 
 ### What Agent B receives
 
@@ -373,6 +419,23 @@ def upcast_credit_decision_v1_to_v2(payload: dict) -> dict:
     }
 ```
 
+### Granular Test Evidence (Pre/Post State)
+
+The upcasting test suite validates the exact structural transformation before the event hits the projection layer:
+
+```text
+TestUpcastCreditDecisionMade:
+  Input (v1): 
+    {'decision': 'approved', 'reason': 'manual review'}
+  Resulting Output (v2): 
+    {'decision': 'approved', 'reason': 'manual review', 
+     'model_version': 'legacy-unversioned', 
+     'confidence_score': None, 
+     'regulatory_basis': 'pre-2026-regulatory-framework'} ✅
+```
+
+This ensures granular, auditable proof of the upcaster's correct execution.
+
 ### The Immutability Contract
 
 > The store is NEVER written during upcasting. Upcasters are pure read-time transformations.
@@ -552,3 +615,23 @@ If an upcaster must reconstruct historical data by querying other streams, **thi
 4. **Contextual upcaster with live store lookup** — **last resort only.** Acceptable for single-aggregate loads (command handling). **Never acceptable in hot paths or full projection rebuilds without precomputation.** Catastrophic O(N) database queries during rebuild.
 
 > **Rule: Contextual upcasters must never be used in hot paths or full rebuilds without precomputation. Enforcement occurs via fail-fast startup validation in the upcaster registry.**
+
+---
+
+## 7. Regulatory Examination Packages (Phase 6)
+
+For high-compliance environments, an event-sourced architecture provides a unique capability: the externalization of truth. Rather than opening the database to regulators or providing static PDFs, the system can generate a **self-contained Regulatory Examination Package**.
+
+### Requirements for Cryptographic Proveability
+A regulator must be able to verify a loan's history without trusting the system that generated it. The package provides:
+1. **The Event Stream**: The raw JSON payloads representing every fact.
+2. **Schema Evolution Trace**: A map showing exactly which fields were upcasted (e.g., inferring `model_version`).
+3. **The Hash Chain Reference**: The cryptographic links needed to re-compute the hash chain.
+
+**Validation Flow:**
+The package includes an `independent_verification` section with the exact pseudo-code needed to compute `canonical_event_hash` and `chain_hash`. A regulator can write a 10-line Python script to hash the provided events and compare the final `chain_hash` against the system's claimed `integrity_hash`. Because the hash includes the `previous_hash` (Merkle-style log), any tampered payload, re-ordered event, or fabricated timestamp will mathematically break the chain.
+
+### Temporal Projections
+Regulators frequently ask: *"What did the compliance officer see at 10:00 AM on Tuesday before they approved this?"*
+Traditional databases overwrite the 10:00 AM state at 11:00 AM.
+The Ledger handles this via **Temporal Projections**. The examination package accepts an `examination_date`. It creates a fresh, empty projection instance and replays the event stream *only up to that date*, discarding future events. The resulting projection state is exactly what the system knew at that historic millisecond. This eliminates hindsight bias from regulatory audits.

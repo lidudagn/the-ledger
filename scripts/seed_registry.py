@@ -16,7 +16,11 @@ import asyncpg
 
 
 SEED_FILE = Path(__file__).parent.parent / "seed_events.jsonl"
-DATABASE_URL = "postgresql://lidya:ledger@localhost/apex_ledger"
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ── Schema DDL ──────────────────────────────────────────────────
 
@@ -287,7 +291,7 @@ async def seed_registry(db_url: str = DATABASE_URL):
     print(f"Found {len(all_company_ids)} unique companies")
 
     # Generate 80 companies (fill in unreferenced ones)
-    for i in range(1, 82):
+    for i in range(1, 81):
         cid = f"COMP-{i:03d}"
         if cid not in all_company_ids:
             all_company_ids.add(cid)

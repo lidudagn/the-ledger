@@ -12,7 +12,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from models.events import StoredEvent
 from projections.base import InMemoryProjectionStore, Projection
 
 
@@ -23,13 +22,13 @@ class ApplicationSummaryProjection(Projection):
     """
     Projection 1: Application Summary.
 
-    Subscribes to 12 loan-lifecycle event types and maintains a single
+    Subscribes to 15 loan-lifecycle event types and maintains a single
     denormalised row per application with current state.
     """
 
     def __init__(self, store: InMemoryProjectionStore | None = None) -> None:
         self._store = store or InMemoryProjectionStore()
-        self._checkpoint: int = 0
+        self._checkpoint: int = -1
 
     @property
     def name(self) -> str:
@@ -39,6 +38,9 @@ class ApplicationSummaryProjection(Projection):
     def subscribed_events(self) -> set[str]:
         return {
             "ApplicationSubmitted",
+            "DocumentUploadRequested",
+            "DocumentUploaded",
+            "CreditAnalysisRequested",
             "CreditAnalysisCompleted",
             "FraudScreeningCompleted",
             "ComplianceCheckRequested",
@@ -52,33 +54,40 @@ class ApplicationSummaryProjection(Projection):
             "AgentSessionCompleted",
         }
 
-    async def handle(self, event: StoredEvent) -> None:
-        """Process a single event. Idempotent via UPSERT."""
-        payload = event.payload
+    async def handle(self, event: dict) -> None:
+        """Process a single event dict. Idempotent via UPSERT."""
+        payload = event.get("payload", {})
         app_id = payload.get("application_id", "")
+        event_type = event.get("event_type", "")
 
         if not app_id:
             # Some events (AgentSessionCompleted) may not have application_id directly
             # Skip those that don't—they update via session tracking
-            if event.event_type == "AgentSessionCompleted":
+            if event_type == "AgentSessionCompleted":
                 await self._handle_session_completed(event)
                 return
             return
 
         # Base update: always set last_event_type and last_event_at
+        recorded_at = event.get("recorded_at")
+        if isinstance(recorded_at, str):
+            recorded_at = datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+        
         update: dict[str, Any] = {
             "application_id": app_id,
-            "last_event_type": event.event_type,
-            "last_event_at": event.recorded_at.isoformat()
-            if event.recorded_at
-            else None,
+            "last_event_type": event_type,
+            "last_event_at": recorded_at,
         }
 
-        handler = getattr(self, f"_handle_{event.event_type}", None)
+        handler = getattr(self, f"_handle_{event_type}", None)
         if handler:
-            handler(payload, update)
+            import asyncio
+            if asyncio.iscoroutinefunction(handler):
+                await handler(payload, update)
+            else:
+                handler(payload, update)
 
-        self._store.upsert(TABLE, app_id, update)
+        await self._store.upsert(TABLE, app_id, update)
 
     def _handle_ApplicationSubmitted(
         self, payload: dict, update: dict
@@ -86,11 +95,39 @@ class ApplicationSummaryProjection(Projection):
         update["state"] = "SUBMITTED"
         update["applicant_id"] = payload.get("applicant_id")
         update["requested_amount_usd"] = payload.get("requested_amount_usd")
+        
+        submitted_at = payload.get("submitted_at")
+        if submitted_at:
+            from datetime import datetime
+            try:
+                # Handle possible trailing Z or +00:00
+                if isinstance(submitted_at, str):
+                    ts = submitted_at.replace("Z", "+00:00")
+                    update["submitted_at"] = datetime.fromisoformat(ts)
+                else: # already datetime
+                    update["submitted_at"] = submitted_at
+            except (ValueError, TypeError):
+                update["submitted_at"] = None
+
+    def _handle_DocumentUploadRequested(
+        self, payload: dict, update: dict
+    ) -> None:
+        update["state"] = "DOCUMENTS_REQUESTED"
+
+    def _handle_DocumentUploaded(
+        self, payload: dict, update: dict
+    ) -> None:
+        update["state"] = "DOCUMENTS_UPLOADED"
+
+    def _handle_CreditAnalysisRequested(
+        self, payload: dict, update: dict
+    ) -> None:
+        update["state"] = "AWAITING_ANALYSIS"
 
     def _handle_CreditAnalysisCompleted(
         self, payload: dict, update: dict
     ) -> None:
-        update["risk_tier"] = payload.get("risk_tier")
+        update["risk_tier"] = payload.get("risk_tier") or payload.get("decision", {}).get("risk_tier")
         update["state"] = "ANALYSIS_COMPLETE"
 
     def _handle_FraudScreeningCompleted(
@@ -140,15 +177,15 @@ class ApplicationSummaryProjection(Projection):
     ) -> None:
         update["state"] = "FINAL_APPROVED"
         update["approved_amount_usd"] = payload.get("approved_amount_usd")
-        update["final_decision_at"] = datetime.now(timezone.utc).isoformat()
+        update["final_decision_at"] = datetime.now(timezone.utc)
 
     def _handle_ApplicationDeclined(
         self, payload: dict, update: dict
     ) -> None:
         update["state"] = "FINAL_DECLINED"
-        update["final_decision_at"] = datetime.now(timezone.utc).isoformat()
+        update["final_decision_at"] = datetime.now(timezone.utc)
 
-    async def _handle_session_completed(self, event: StoredEvent) -> None:
+    async def _handle_session_completed(self, event: dict) -> None:
         """Track completed agent sessions for applications."""
         # AgentSessionCompleted may not have application_id in payload
         # In a full system, we'd correlate via session stream.
@@ -157,8 +194,8 @@ class ApplicationSummaryProjection(Projection):
 
     async def rebuild_from_scratch(self) -> None:
         """Truncate and reset to zero."""
-        self._store.truncate(TABLE)
-        self._checkpoint = 0
+        await self._store.truncate(TABLE)
+        self._checkpoint = -1
 
     # -- Query methods --
 

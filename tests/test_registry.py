@@ -22,7 +22,13 @@ from registry.client import (
     LoanRelationship,
 )
 
-DATABASE_URL = "postgresql://lidya:ledger@localhost/apex_ledger"
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+pytestmark = pytest.mark.skipif(
+    DATABASE_URL is None,
+    reason="DATABASE_URL not set — skipping real DB tests",
+)
 
 
 @pytest.fixture
@@ -119,6 +125,32 @@ class TestFinancialHistory:
         (In our seed, every company has 3 years, but the client must handle fewer.)"""
         history = await client.get_financial_history("COMP-001")
         assert isinstance(history, list)
+
+    async def test_financial_history_handles_incomplete_years(self, client):
+        """If a company has fewer than 3 fiscal years, the client must:
+        - Not crash
+        - Return correct ordering
+        - Return a list shorter than 3
+        This is critical because agents must handle incomplete data safely.
+        We test with a non-existent company (0 years) as the extreme case,
+        and then verify the client contract holds for any result length."""
+        # Extreme case: no history at all
+        history = await client.get_financial_history("COMP-999")
+        assert isinstance(history, list)
+        assert len(history) == 0
+
+        # Normal case: verify the contract even for existing companies
+        history = await client.get_financial_history("COMP-001")
+        assert len(history) <= 3
+        # Must still be ordered ascending
+        for i in range(1, len(history)):
+            assert history[i].fiscal_year > history[i - 1].fiscal_year
+        # All entries must have non-null required fields
+        for fy in history:
+            assert fy.total_revenue is not None
+            assert fy.net_income is not None
+            assert fy.total_assets is not None
+            assert fy.total_liabilities is not None
 
 
 # ═══════════════════════════════════════════════════════════════

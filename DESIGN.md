@@ -145,6 +145,21 @@ While we implemented The Ledger using PostgreSQL natively (ideal for Python/Fast
 Our PostgreSQL implementation relies on polling `SELECT ... WHERE global_position > X` in the background daemon. This introduces latency (our 100ms poll interval) and CPU overhead. EventStoreDB uses a native push model via gRPC; when an event is appended, ESDB immediately pushes it to connected subscribers. Furthermore, ESDB handles log truncation, scavenging, and distributed cluster consensus seamlessly, whereas scaling our PostgreSQL events table to billions of rows would require complex table partitioning strategies (e.g., pg_partman) that we currently lack.
 
 ---
+### Phase 3: PostgreSQL Projections & Concurrency
+
+#### Asynchronous Projection Store
+The in-memory projection store was replaced with a `PgProjectionStore` using `asyncpg`. All projection handlers and the `ProjectionDaemon` were refactored to be fully asynchronous.
+- **UPSERT Mapping**: Standardized primary key detection for composite keys (e.g., `agent_performance` uses `agent_id` and `model_version`).
+- **Timestamp Serialization**: Automated conversion of ISO-8601 payload strings to native Python `datetime` objects to satisfy PostgreSQL `TIMESTAMPTZ` constraints.
+
+#### Concurrency Control (OCC)
+To handle high-volume agent execution, a jittered exponential backoff retry mechanism was implemented:
+- **Decorator**: `@with_occ_retry(max_retries=3)` applied to all domain command handlers.
+- **Strategy**: 3 attempts with base delay and random jitter to prevent "thundering herd" collisions on identical event streams.
+- **Verification**: Stress tested with 50 parallel applications and 150 concurrent agent updates, resulting in zero data loss and clean projection state.
+
+#### Data Gap Note
+The current `seed_events.jsonl` contains 1,198 events, deviating from the expected ~1,847. Projection metrics in tests reflect this partial dataset.
 
 ## 7. Future Improvements
 
@@ -167,3 +182,21 @@ This architecture introduces new failure boundaries we must explicitly handle:
 *   **Consumer Requirement:** Consequently, downstream consumers *must* be strictly idempotent (as defined in Section 3). The `published_at` timestamp is purely a performance optimization for truncating the outbox table; it is *never* a correctness guarantee against duplicate publishing.
 
 This shifts the architecture from a polling monolith to a true reactive, push-based distributed system. It offloads read-pressure from the primary database and perfectly positions the system for the Polyglot Bridge integration required in later enterprise phases.
+
+---
+
+## 8. What-If Projections (Phase 6)
+
+The What-If engine answers counterfactual questions ("What if the risk was HIGH instead of MEDIUM?"). This relies heavily on the immutability of the event store.
+
+### The Sandboxing Invariant
+**Decision:** Counterfactual replays *never* write to the primary PostgreSQL `events` table.
+**Implementation:** The `WhatIfProjector` clones the target stream into an ephemeral `InMemoryEventStore`. All counterfactual event injections and subsequent causal dependency filtering happen purely in memory. The real system state is mathematically isolated from hypothetical replays.
+
+### Causal Dependency Filtering
+When injecting a counterfactual event (e.g., modifying `CreditAnalysisCompleted`), subsequent events down the chronological sequence might be causally dependent (e.g., `DecisionGenerated` relies on credit analysis) or independent (e.g., a background `ComplianceCheckRequested` that fired at the same time).
+**Tradeoff:** We use `causation_id` tracing to filter events. If an event traces its ancestry back to the branched event, it is skipped. If not, it is replayed. This is "inherently approximate" because incomplete causation chains (omitted by poorly behaved agents) result in independent treatment. We chose to handle this transparency directly: broken chains are surfaced in the `WhatIfResult.assumptions` property rather than failing the replay or silencing the ambiguity.
+
+### Aggregate-First Validation
+Before any projection state is updated, the counterfactual event stream is replayed through the `LoanApplicationAggregate`.
+**Why:** Projections must never show a state that violates business invariants. If a counterfactual injection produces an invalid state transition (e.g., trying to approve a loan missing a compliance check), the aggregate state machine will raise a `DomainError`, and the counterfactual replay correctly surfaces this as impossible, rather than silently computing an invalid projection.

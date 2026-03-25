@@ -56,6 +56,20 @@ class BaseEvent(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    def __getitem__(self, item: str) -> Any:
+        return self.model_dump()[item] if item in self.model_fields else getattr(self, item)
+
+    def __contains__(self, item: str) -> bool:
+        return item in self.model_fields or hasattr(self, item)
+
+    def get(self, item: str, default: Any = None) -> Any:
+        if item in self.model_fields:
+            return self.model_dump().get(item, default)
+        return getattr(self, item, default)
+
+    def to_store_dict(self) -> dict[str, Any]:
+        return self.model_dump(exclude_none=True)
+
 
 class StoredEvent(BaseEvent):
     """
@@ -68,6 +82,13 @@ class StoredEvent(BaseEvent):
     stream_position: int
     global_position: int
     recorded_at: datetime
+
+    def with_payload(self, new_payload: dict, version: int | None = None) -> "StoredEvent":
+        """Return a copy with updated payload (and optionally version). Used by upcasters."""
+        updates: dict = {"payload": new_payload}
+        if version is not None:
+            updates["event_version"] = version
+        return self.model_copy(update=updates)
 
 
 class StreamMetadata(BaseModel):
@@ -89,16 +110,26 @@ class StreamMetadata(BaseModel):
 class DomainError(Exception):
     """Base error for domain logic violations (Phase 2+)."""
 
+    message: str
+
     def __init__(self, message: str) -> None:
         self.message = message
         super().__init__(message)
 
 
-class OptimisticConcurrencyError(DomainError):
+class OptimisticConcurrencyError(Exception):
     """
     Raised when append() detects a version mismatch.
     The caller must reload the stream and retry.
+    Separate from DomainError — concurrency conflicts are infrastructure,
+    not domain logic violations.
     """
+
+    stream_id: str
+    expected_version: int
+    actual_version: int
+    suggested_action: str
+    message: str
 
     def __init__(
         self, stream_id: str, expected_version: int, actual_version: int
@@ -106,14 +137,18 @@ class OptimisticConcurrencyError(DomainError):
         self.stream_id = stream_id
         self.expected_version = expected_version
         self.actual_version = actual_version
-        super().__init__(
+        self.suggested_action = "reload_stream_and_retry"
+        self.message = (
             f"Concurrency conflict on stream '{stream_id}': "
             f"expected version {expected_version}, actual {actual_version}"
         )
+        super().__init__(self.message)
 
 
 class StreamNotFoundError(DomainError):
     """Raised when loading a stream that does not exist."""
+
+    stream_id: str
 
     def __init__(self, stream_id: str) -> None:
         self.stream_id = stream_id
@@ -122,6 +157,8 @@ class StreamNotFoundError(DomainError):
 
 class StreamArchivedError(DomainError):
     """Raised when attempting to append to an archived stream."""
+
+    stream_id: str
 
     def __init__(self, stream_id: str) -> None:
         self.stream_id = stream_id

@@ -75,7 +75,9 @@ class TestErrors:
         assert err.stream_id == "loan-001"
         assert err.expected_version == 3
         assert err.actual_version == 5
-        assert isinstance(err, DomainError)
+        assert isinstance(err, Exception)
+        assert not isinstance(err, DomainError)  # OCC is infrastructure, not domain
+        assert err.suggested_action == "reload_stream_and_retry"
 
     def test_stream_not_found(self):
         err = StreamNotFoundError("loan-999")

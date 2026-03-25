@@ -15,11 +15,11 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from domain.aggregates.loan_application import (
+from aggregates.loan_application import (
     ApplicationState,
     LoanApplicationAggregate,
 )
-from domain.commands.handlers import (
+from commands.handlers import (
     GenerateDecisionCommand,
     HumanReviewCompletedCommand,
     handle_decision_generated,

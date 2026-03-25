@@ -20,12 +20,12 @@ import asyncio
 
 import pytest
 
-from domain.aggregates.agent_session import AgentSessionAggregate, SessionState
-from domain.aggregates.loan_application import (
+from aggregates.agent_session import AgentSessionAggregate, SessionState
+from aggregates.loan_application import (
     ApplicationState,
     LoanApplicationAggregate,
 )
-from domain.commands.handlers import (
+from commands.handlers import (
     ApproveApplicationCommand,
     CreditAnalysisCompletedCommand,
     FraudScreeningCompletedCommand,
@@ -226,6 +226,36 @@ class TestStateTransitions:
         with pytest.raises(DomainError, match="Invalid state transition"):
             await LoanApplicationAggregate.load(store, "APP-001")
 
+    async def test_refer_blocks_second_decision(self, store):
+        """REFER decision must go through human review first."""
+        await _advance_to_pending_decision(store, "APP-REFER")
+        
+        # Generate decision with REFER
+        await handle_decision_generated(
+            GenerateDecisionCommand(
+                application_id="APP-REFER",
+                orchestrator_agent_id="orch",
+                recommendation="REFER",
+                confidence_score=0.5,
+                contributing_agent_sessions=[],
+            ),
+            store
+        )
+        
+        # Try second DecisionGenerated → should raise DomainError
+        from models.events import DomainError
+        with pytest.raises(DomainError, match="REFER decision is pending human review"):
+            await handle_decision_generated(
+                GenerateDecisionCommand(
+                    application_id="APP-REFER",
+                    orchestrator_agent_id="orch",
+                    recommendation="APPROVE",
+                    confidence_score=0.9,
+                    contributing_agent_sessions=[],
+                ),
+                store
+            )
+
 
 # =============================================================================
 # Test 4-5: Gas Town enforcement
@@ -336,6 +366,37 @@ class TestComplianceDependency:
             compliance_events=compliance_events,
             required_checks=["REG-001", "REG-002"],
         )
+
+    async def test_human_approve_blocked_without_compliance(self, store):
+        """BR4: Human cannot approve if compliance checks are not passed."""
+        await _advance_to_pending_decision(store, "APP-HUMAN")
+        app = await LoanApplicationAggregate.load(store, "APP-HUMAN")
+        app.required_checks = ["REG-001"]
+        # Fake a decline to get to DECLINED_PENDING_HUMAN
+        await handle_decision_generated(
+            GenerateDecisionCommand(
+                application_id="APP-HUMAN",
+                orchestrator_agent_id="orch",
+                recommendation="DECLINE",
+                confidence_score=0.9,
+                contributing_agent_sessions=[],
+            ),
+            store
+        )
+        
+        # Try handle_human_review_completed with final_decision="APPROVE"
+        from models.events import DomainError
+        with pytest.raises(DomainError, match="compliance checks not passed"):
+            await handle_human_review_completed(
+                HumanReviewCompletedCommand(
+                    application_id="APP-HUMAN",
+                    reviewer_id="human-01",
+                    override=True,
+                    override_reason="Because I said so",
+                    final_decision="APPROVE"
+                ),
+                store
+            )
 
 
 # =============================================================================

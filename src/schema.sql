@@ -20,8 +20,8 @@ CREATE TABLE IF NOT EXISTS events (
     -- OCC enforcement at storage layer
     CONSTRAINT uq_stream_position UNIQUE (stream_id, stream_position),
 
-    -- Prevent zero/negative positions (defensive)
-    CONSTRAINT chk_stream_position_positive CHECK (stream_position > 0)
+    -- Prevent negative positions (defensive)
+    CONSTRAINT chk_stream_position_positive CHECK (stream_position >= 0)
 );
 
 -- Contract C3: global_position provides total ordering but NOT contiguous sequencing.
@@ -85,6 +85,9 @@ CREATE TABLE IF NOT EXISTS application_summary (
     agent_sessions       JSONB NOT NULL DEFAULT '[]'::jsonb,
     last_event_type      TEXT,
     last_event_at        TIMESTAMPTZ,
+    submitted_at         TIMESTAMPTZ,
+    approved_at          TIMESTAMPTZ,
+    declined_at          TIMESTAMPTZ,
     human_reviewer_id    TEXT,
     final_decision_at    TIMESTAMPTZ,
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()

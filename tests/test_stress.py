@@ -12,9 +12,9 @@ import uuid
 
 import pytest
 
-from domain.aggregates.agent_session import SessionState, AgentSessionAggregate
-from domain.aggregates.loan_application import ApplicationState, LoanApplicationAggregate
-from domain.commands.handlers import (
+from aggregates.agent_session import SessionState, AgentSessionAggregate
+from aggregates.loan_application import ApplicationState, LoanApplicationAggregate
+from commands.handlers import (
     ApproveApplicationCommand,
     CreditAnalysisCompletedCommand,
     FraudScreeningCompletedCommand,
@@ -84,9 +84,11 @@ class TestFullWorkflow:
         # 3. Setup Agent Session & Complete Credit
         agent_id = "agent-cred-1"
         session_id = "sess-cred-1"
+        from models.events import AgentOutputWritten
         await store.append(f"agent-{agent_id}-{session_id}", [
             AgentSessionStarted(payload={"agent_id": agent_id, "session_id": session_id}),
-            AgentContextLoaded(payload={"agent_id": agent_id, "session_id": session_id, "model_version": "v1"})
+            AgentContextLoaded(payload={"agent_id": agent_id, "session_id": session_id, "model_version": "v1"}),
+            AgentOutputWritten(payload={"agent_id": agent_id, "session_id": session_id, "application_id": app_id})
         ], expected_version=-1)
         
         await handle_credit_analysis_completed(
@@ -102,7 +104,8 @@ class TestFullWorkflow:
         session_id_f = "sess-fraud-1"
         await store.append(f"agent-{agent_id_f}-{session_id_f}", [
             AgentSessionStarted(payload={"agent_id": agent_id_f, "session_id": session_id_f}),
-            AgentContextLoaded(payload={"agent_id": agent_id_f, "session_id": session_id_f, "model_version": "v2"})
+            AgentContextLoaded(payload={"agent_id": agent_id_f, "session_id": session_id_f, "model_version": "v2"}),
+            AgentOutputWritten(payload={"agent_id": agent_id_f, "session_id": session_id_f, "application_id": app_id})
         ], expected_version=-1)
         
         await handle_fraud_screening_completed(
@@ -150,7 +153,7 @@ class TestFullWorkflow:
 
         app = await LoanApplicationAggregate.load(store, app_id)
         assert app.state == ApplicationState.FINAL_APPROVED
-        assert app.approved_amount == 0.0  # Approves with 0 by default until explicit amount is passed.
+        assert app.approved_amount == 100000.0
 
 
 # =============================================================================

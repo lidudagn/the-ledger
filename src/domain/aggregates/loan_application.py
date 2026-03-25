@@ -137,22 +137,29 @@ class LoanApplicationAggregate:
             return agg
 
         for event in events:
-            agg._apply(event)
+            agg.apply(event)
         return agg
 
     # -------------------------------------------------------------------------
     # Event replay
     # -------------------------------------------------------------------------
 
-    def _apply(self, event: StoredEvent) -> None:
+    def apply(self, event: StoredEvent, is_replay: bool = False) -> None:
         """Route event to the correct handler by event_type."""
-        handler = getattr(self, f"_on_{event.event_type}", None)
-        if handler:
-            handler(event)
-        self.version = event.stream_position
+        self._is_replay = is_replay
+        try:
+            handler = getattr(self, f"_on_{event.event_type}", None)
+            if handler:
+                handler(event)
+        finally:
+            self.version = event.stream_position
+            self._is_replay = False
 
     def _validate_transition(self, new_state: ApplicationState) -> None:
         """BR1: Raise DomainError if transition is invalid."""
+        if getattr(self, "_is_replay", False):
+            return
+
         allowed = VALID_TRANSITIONS.get(self.state, set())
         if new_state not in allowed:
             raise DomainError(

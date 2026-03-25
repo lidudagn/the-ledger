@@ -15,7 +15,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from models.events import StoredEvent
 from projections.base import InMemoryProjectionStore, Projection
 
 
@@ -33,7 +32,7 @@ class ComplianceAuditViewProjection(Projection):
 
     def __init__(self, store: InMemoryProjectionStore | None = None) -> None:
         self._store = store or InMemoryProjectionStore()
-        self._checkpoint: int = 0
+        self._checkpoint: int = -1
 
     @property
     def name(self) -> str:
@@ -49,70 +48,74 @@ class ComplianceAuditViewProjection(Projection):
             "ComplianceCheckCompleted",
         }
 
-    async def handle(self, event: StoredEvent) -> None:
+    async def handle(self, event: dict) -> None:
         """
         Process a compliance event. Idempotent via INSERT ON CONFLICT DO NOTHING
         keyed on global_position.
         """
-        payload = event.payload
+        payload = event.get("payload", {})
         app_id = payload.get("application_id", "")
+        event_type = event.get("event_type", "")
+        global_position = event.get("global_position", 0)
+        recorded_at = event.get("recorded_at")
 
         # Build the audit event row
         row = {
             "application_id": app_id,
-            "event_type": event.event_type,
+            "event_type": event_type,
             "rule_id": payload.get("rule_id"),
             "rule_version": payload.get("rule_version"),
             "failure_reason": payload.get("failure_reason"),
             "is_hard_block": payload.get("is_hard_block", False),
             "regulation_version": payload.get("regulation_set_version"),
             "evidence_hash": payload.get("evidence_hash"),
-            "global_position": event.global_position,
-            "recorded_at": event.recorded_at.isoformat()
-            if event.recorded_at
-            else None,
+            "global_position": global_position,
+            "recorded_at": recorded_at,
             "payload": payload,
         }
 
         # Determine verdict
-        if event.event_type == "ComplianceRulePassed":
+        if event_type == "ComplianceRulePassed":
             row["verdict"] = "PASSED"
-        elif event.event_type == "ComplianceRuleFailed":
+        elif event_type == "ComplianceRuleFailed":
             row["verdict"] = "FAILED"
-        elif event.event_type == "ComplianceRuleNoted":
+        elif event_type == "ComplianceRuleNoted":
             row["verdict"] = "NOTED"
-        elif event.event_type == "ComplianceCheckInitiated":
+        elif event_type == "ComplianceCheckInitiated":
             row["verdict"] = "INITIATED"
-        elif event.event_type == "ComplianceCheckCompleted":
+        elif event_type == "ComplianceCheckCompleted":
             row["verdict"] = "COMPLETED"
 
         # Insert (idempotent: skip if global_position already exists)
-        self._store.insert_if_absent(
-            EVENTS_TABLE, event.global_position, row
+        await self._store.insert_if_absent(
+            EVENTS_TABLE, global_position, row
         )
 
         # On ComplianceCheckCompleted → create snapshot
-        if event.event_type == "ComplianceCheckCompleted":
+        if event_type == "ComplianceCheckCompleted":
             await self._create_snapshot(app_id, event)
 
     async def _create_snapshot(
-        self, application_id: str, completed_event: StoredEvent
+        self, application_id: str, completed_event: dict
     ) -> None:
         """Create a point-in-time compliance snapshot."""
+        global_position = completed_event.get("global_position", 0)
+        
         # Gather all compliance events for this application up to this point
         all_events = self._store.query(
             EVENTS_TABLE,
             lambda r: (
                 r.get("application_id") == application_id
                 and r.get("global_position", 0)
-                <= completed_event.global_position
+                <= global_position
             ),
         )
 
         # Compute snapshot state
         rules_evaluated = []
         has_hard_block = False
-        overall_verdict = completed_event.payload.get(
+        payload = completed_event.get("payload", {})
+        overall_verdict = payload.get(
             "overall_verdict", "CLEAR"
         )
 
@@ -130,23 +133,24 @@ class ComplianceAuditViewProjection(Projection):
             if evt.get("is_hard_block") and evt.get("verdict") == "FAILED":
                 has_hard_block = True
 
+        recorded_at = completed_event.get("recorded_at")
         snapshot_at = (
-            completed_event.recorded_at.isoformat()
-            if completed_event.recorded_at
-            else datetime.now(timezone.utc).isoformat()
+            recorded_at.isoformat()
+            if recorded_at and hasattr(recorded_at, "isoformat")
+            else (recorded_at if isinstance(recorded_at, str) else datetime.now(timezone.utc).isoformat())
         )
 
         snapshot = {
             "application_id": application_id,
             "snapshot_at": snapshot_at,
-            "global_position": completed_event.global_position,
+            "global_position": global_position,
             "overall_verdict": overall_verdict,
             "rules_evaluated": rules_evaluated,
             "has_hard_block": has_hard_block,
         }
 
         snapshot_key = (application_id, snapshot_at)
-        self._store.upsert(SNAPSHOTS_TABLE, snapshot_key, snapshot)
+        await self._store.upsert(SNAPSHOTS_TABLE, snapshot_key, snapshot)
 
     # -------------------------------------------------------------------------
     # Temporal Queries
@@ -255,7 +259,11 @@ class ComplianceAuditViewProjection(Projection):
         def event_filter(r: dict) -> bool:
             if r.get("application_id") != application_id:
                 return False
-            if (r.get("recorded_at") or "") > (as_of_iso or ""):
+            
+            recorded_at = r.get("recorded_at")
+            recorded_at_str = recorded_at.isoformat() if hasattr(recorded_at, "isoformat") else str(recorded_at or "")
+            
+            if recorded_at_str > (as_of_iso or ""):
                 return False
             if up_to_position is not None:
                 if r.get("global_position", 0) > up_to_position:
@@ -307,6 +315,6 @@ class ComplianceAuditViewProjection(Projection):
 
     async def rebuild_from_scratch(self) -> None:
         """Truncate both tables and reset checkpoint."""
-        self._store.truncate(EVENTS_TABLE)
-        self._store.truncate(SNAPSHOTS_TABLE)
-        self._checkpoint = 0
+        await self._store.truncate(EVENTS_TABLE)
+        await self._store.truncate(SNAPSHOTS_TABLE)
+        self._checkpoint = -1
